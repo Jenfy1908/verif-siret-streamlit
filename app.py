@@ -3,17 +3,20 @@ import pandas as pd
 import requests
 import time
 
+# ✅ TEST INFAILLIBLE : si tu vois ce message sur Streamlit, c'est bien le bon code qui tourne
+st.write("### ✅ VERSION NOUVELLE - 06/01/2026")
+
 # ----------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------
-API_KEY = st.secrets["API_KEY"]  # KEY SÉCURISÉE
+API_KEY = st.secrets["API_KEY"]  # Clé API INSEE (Streamlit Secrets)
 HEADERS = {"X-INSEE-Api-Key-Integration": API_KEY}
 API_URL = "https://api.insee.fr/api-sirene/3.11/siret/"
 
 st.set_page_config(page_title="Vérification SIRET", page_icon="🏢")
 
 st.title("🏢 Vérificateur SIRET - API INSEE")
-st.write("Importez un CSV contenant une colonne **siret** puis lancez la vérification.")
+st.write("Importez un fichier CSV contenant une colonne **siret**, puis lancez la vérification.")
 
 # ----------------------------------------------------------
 # UPLOAD CSV
@@ -50,14 +53,14 @@ if uploaded_file:
                         )
 
                         if etat == "A":
-                            validite = "actif"
+                            statut = "Actif"
                         elif etat == "F":
-                            validite = "fermé"
+                            statut = "Fermé"
                         else:
-                            validite = f"inconnu ({etat})"
+                            statut = f"Inconnu ({etat})"
 
                     elif code == 404:
-                        validite = "inexistant"
+                        statut = "Inexistant"
 
                     elif code == 429:
                         status.warning("⚠️ Limite API atteinte — pause 15s…")
@@ -65,11 +68,11 @@ if uploaded_file:
                         continue
 
                     else:
-                        validite = f"erreur ({code})"
+                        statut = f"Erreur ({code})"
 
-                    results.append({"siret": siret, "validite": validite})
+                    results.append({"SIRET": siret, "Statut": statut})
                     progress.progress(i / len(siret_list))
-                    status.text(f"{i}/{len(siret_list)} : {siret} → {validite}")
+                    status.text(f"{i}/{len(siret_list)} : {siret} → {statut}")
                     break
 
                 time.sleep(0.3)
@@ -87,10 +90,10 @@ if uploaded_file:
                     return f"{s[:3]} {s[3:6]} {s[6:9]} {s[9:14]}"
                 return s
 
-            df_res["siret"] = df_res["siret"].apply(format_siret)
+            df_res["SIRET"] = df_res["SIRET"].apply(format_siret)
 
             # Style couleur selon statut
-            def style_validite(val):
+            def style_statut(val):
                 v = str(val).lower()
                 if "actif" in v:
                     return "background-color: #c6efce; color: #006100; font-weight: bold;"
@@ -100,7 +103,7 @@ if uploaded_file:
                     return "background-color: #ffeb9c; color: #9c5700; font-weight: bold;"
                 return ""
 
-            styled_df = df_res.style.applymap(style_validite, subset=["validite"])
+            styled_df = df_res.style.applymap(style_statut, subset=["Statut"])
 
             st.subheader("📊 Résultats")
             st.dataframe(styled_df, use_container_width=True)
