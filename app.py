@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
-import html as pyhtml
-
-st.error("TEST COULEUR : SI TU VOIS CE MESSAGE, STREAMLIT UTILISE BIEN CETTE VERSION")
+from io import BytesIO
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 # ----------------------------------------------------------
 # CONFIGURATION
@@ -14,66 +14,38 @@ HEADERS = {"X-INSEE-Api-Key-Integration": API_KEY}
 API_URL = "https://api.insee.fr/api-sirene/3.11/siret/"
 
 st.set_page_config(page_title="Vérification SIRET", page_icon="🏢")
-
 st.title("🏢 Vérificateur SIRET - API INSEE")
-st.write("Importez un fichier CSV contenant une colonne **siret** (14 chiffres).")
 
 # ----------------------------------------------------------
-# Helpers
+# HELPERS
 # ----------------------------------------------------------
 def normalize_siret(s):
-    return "".join(ch for ch in str(s) if ch.isdigit())
+    return "".join(c for c in str(s) if c.isdigit())
 
-def render_table(df):
-    css = """
-    <style>
-      table { width:100%; border-collapse: collapse; font-family: Arial, sans-serif; }
-      th, td { border:1px solid #ddd; padding:8px; }
-      th { background:#f4f4f4; text-align:left; }
-      .ok { background:#c6efce; color:#006100; font-weight:bold; }
-      .bad { background:#ffc7ce; color:#9c0006; font-weight:bold; }
-      .warn { background:#ffeb9c; color:#9c5700; font-weight:bold; }
-      .mono { font-family: Consolas, monospace; }
-    </style>
-    """
+def statut_from_etat(etat):
+    if etat == "A":
+        return "Actif"
+    if etat == "F":
+        return "Fermé"
+    return f"Inconnu ({etat})"
 
-    rows = []
-    for _, r in df.iterrows():
-        statut = r["Statut"].lower()
-        if "actif" in statut:
-            cls = "ok"
-        elif "fermé" in statut:
-            cls = "bad"
-        else:
-            cls = "warn"
-
-        rows.append(
-            f"<tr>"
-            f"<td class='mono'>{pyhtml.escape(r['SIRET'])}</td>"
-            f"<td class='{cls}'>{pyhtml.escape(r['Statut'])}</td>"
-            f"</tr>"
-        )
-
-    html = css + (
-        "<table>"
-        "<thead><tr><th>SIRET</th><th>Statut</th></tr></thead>"
-        "<tbody>"
-        + "".join(rows) +
-        "</tbody></table>"
-    )
-
-    st.markdown(html, unsafe_allow_html=True)
+def color_fill(statut):
+    if "Actif" in statut:
+        return PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    if "Fermé" in statut:
+        return PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    return PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
 
 # ----------------------------------------------------------
 # UPLOAD CSV
 # ----------------------------------------------------------
-uploaded_file = st.file_uploader("📂 Importer fichier CSV", type=["csv"])
+uploaded_file = st.file_uploader("📂 Importer fichier CSV (colonne 'siret')", type=["csv"])
 
 if uploaded_file:
     df_in = pd.read_csv(uploaded_file, dtype=str)
 
     if "siret" not in df_in.columns:
-        st.error("❌ Le fichier doit contenir une colonne 'siret'.")
+        st.error("❌ Le fichier doit contenir une colonne 'siret'")
         st.stop()
 
     sirets = df_in["siret"].dropna().tolist()
@@ -97,7 +69,7 @@ if uploaded_file:
                         .get("periodesEtablissement", [{}])[0]
                         .get("etatAdministratifEtablissement", "INCONNU")
                     )
-                    statut = "Actif" if etat == "A" else "Fermé" if etat == "F" else f"Inconnu ({etat})"
+                    statut = statut_from_etat(etat)
 
                 elif r.status_code == 404:
                     statut = "Inexistant"
@@ -118,14 +90,30 @@ if uploaded_file:
         df_res = pd.DataFrame(results)
         st.success("✅ Vérification terminée")
 
-        st.subheader("📊 Résultats")
-        render_table(df_res)
+        # ----------------------------------------------------------
+        # EXPORT EXCEL STYLÉ
+        # ----------------------------------------------------------
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df_res.to_excel(writer, index=False, sheet_name="Résultats")
+
+        output.seek(0)
+        wb = load_workbook(output)
+        ws = wb.active
+
+        for row in range(2, ws.max_row + 1):
+            cell = ws[f"B{row}"]  # colonne Statut
+            cell.fill = color_fill(cell.value)
+
+        final_output = BytesIO()
+        wb.save(final_output)
+        final_output.seek(0)
 
         st.download_button(
-            "📥 Télécharger les résultats (CSV)",
-            df_res.to_csv(index=False, sep=";").encode("utf-8"),
-            "resultats_siret.csv",
-            "text/csv",
+            "📥 Télécharger les résultats (Excel)",
+            final_output,
+            file_name="resultats_siret.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
 else:
