@@ -4,6 +4,8 @@ import requests
 import time
 import html as pyhtml
 
+st.error("TEST COULEUR : SI TU VOIS CE MESSAGE, STREAMLIT UTILISE BIEN CETTE VERSION")
+
 # ----------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------
