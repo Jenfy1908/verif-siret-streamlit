@@ -19,20 +19,28 @@ st.title("🏢 Vérificateur SIRET - API INSEE")
 # ----------------------------------------------------------
 # HELPERS
 # ----------------------------------------------------------
-def normalize_siret(s):
+def normalize_siret(s) -> str:
+    """Garde uniquement les chiffres."""
     return "".join(c for c in str(s) if c.isdigit())
 
-def statut_from_etat(etat):
+def statut_from_etat(etat: str) -> str:
     if etat == "A":
         return "Actif"
     if etat == "F":
         return "Fermé"
     return f"Inconnu ({etat})"
 
-def color_fill(statut):
-    if "Actif" in statut:
+def fill_for_statut(statut: str) -> PatternFill:
+    """
+    Couleurs Excel:
+    - Actif  -> vert
+    - Fermé  -> rouge
+    - Autre  -> orange
+    """
+    s = (statut or "").lower()
+    if "actif" in s:
         return PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    if "Fermé" in statut:
+    if "fermé" in s or "ferme" in s:
         return PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     return PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
 
@@ -54,6 +62,7 @@ if uploaded_file:
     if st.button("🚀 Lancer la vérification"):
         results = []
         progress = st.progress(0)
+        status = st.empty()
 
         for i, s in enumerate(sirets, start=1):
             siret = normalize_siret(s)
@@ -75,6 +84,7 @@ if uploaded_file:
                     statut = "Inexistant"
 
                 elif r.status_code == 429:
+                    status.warning("⚠️ Limite API atteinte — pause 15s…")
                     time.sleep(15)
                     continue
 
@@ -83,6 +93,7 @@ if uploaded_file:
 
                 results.append({"SIRET": siret, "Statut": statut})
                 progress.progress(i / len(sirets))
+                status.text(f"{i}/{len(sirets)} : {siret} → {statut}")
                 break
 
             time.sleep(0.3)
@@ -91,7 +102,7 @@ if uploaded_file:
         st.success("✅ Vérification terminée")
 
         # ----------------------------------------------------------
-        # EXPORT EXCEL STYLÉ
+        # EXPORT EXCEL STYLÉ (colorer SIRET + Statut)
         # ----------------------------------------------------------
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -99,11 +110,15 @@ if uploaded_file:
 
         output.seek(0)
         wb = load_workbook(output)
-        ws = wb.active
+        ws = wb["Résultats"]
 
-        for row in range(2, ws.max_row + 1):
-            cell = ws[f"B{row}"]  # colonne Statut
-            cell.fill = color_fill(cell.value)
+        # Colorer colonnes A (SIRET) ET B (Statut) selon le statut (colonne B)
+        for row in range(2, ws.max_row + 1):  # 1 = header
+            statut_value = ws[f"B{row}"].value
+            fill = fill_for_statut(str(statut_value) if statut_value is not None else "")
+
+            ws[f"A{row}"].fill = fill  # <-- SIRET coloré aussi
+            ws[f"B{row}"].fill = fill  # <-- Statut coloré
 
         final_output = BytesIO()
         wb.save(final_output)
