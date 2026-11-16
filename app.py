@@ -198,9 +198,9 @@ def annuaire_candidates(ville, departement):
             continue
         if not re.fullmatch(r"/societes/[^/]+/", parsed.path):
             continue
-        title = link.get_text(" ", strip=True)
-        if not title:
-            title = parsed.path.strip('/').split('/')[-1].replace('-', ' ')
+        # The anchor text also contains the postal code, city and telephone.
+        # The URL slug is a cleaner candidate for name matching.
+        title = parsed.path.strip('/').split('/')[-1].replace('-', ' ')
         # A directory listing can contain several links to the same profile.
         if href not in found or len(title) > len(found[href]):
             found[href] = title
@@ -208,48 +208,6 @@ def annuaire_candidates(ville, departement):
         return [], f"Aucune fiche individuelle détectée dans la page de résultats de {ville}."
     return [(name, href) for href, name in found.items()], ""
 
-
-
-
-def diagnostic_annuaire(commune, rows):
-    """Diagnostic ponctuel : métadonnées et liens publics, sans données sensibles."""
-    ville = commune["nom"]
-    url = annuaire_search_url(ville, commune.get("codeDepartement", "33"))
-    report = {"Commune": ville, "URL interrogée": url}
-    try:
-        response = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; DirectoryLinkFinder/1.0)"},
-            timeout=12,
-        )
-        report["Statut HTTP"] = response.status_code
-        report["URL finale"] = response.url
-        report["Type de contenu"] = response.headers.get("Content-Type", "")
-        report["Taille réponse (octets)"] = len(response.content)
-        soup = BeautifulSoup(response.text, "html.parser")
-        report["Titre HTML"] = soup.title.get_text(" ", strip=True)[:180] if soup.title else "(aucun)"
-        links = soup.select("a[href]")
-        report["Nombre de liens HTML"] = len(links)
-        report["Liens de fiches détectés"] = len({
-            urljoin(ANNUAIRE_BASE, a.get("href", "")) for a in links
-            if urlparse(urljoin(ANNUAIRE_BASE, a.get("href", ""))).netloc == urlparse(ANNUAIRE_BASE).netloc
-            and re.fullmatch(r"/societes/[^/]+/", urlparse(urljoin(ANNUAIRE_BASE, a.get("href", ""))).path)
-        })
-        report["Exemples de liens /societes/"] = [
-            {"Texte": a.get_text(" ", strip=True)[:85], "URL": urljoin(ANNUAIRE_BASE, a.get("href", ""))}
-            for a in links
-            if "/societes/" in a.get("href", "")
-        ][:12]
-        report["Noms INSEE (extrait)"] = [r.get("Raison sociale", "") for r in rows if r.get("Code commune") == commune["code"]][:15]
-        if response.status_code != 200:
-            report["Conclusion"] = "Le serveur ne renvoie pas HTTP 200. Vérifier l'accès à l'annuaire."
-        elif report["Liens de fiches détectés"] == 0:
-            report["Conclusion"] = "Aucun lien individuel dans le HTML reçu : vérifier la structure de la page ou un éventuel chargement JavaScript."
-        else:
-            report["Conclusion"] = "Des fiches sont présentes. Vérifier les libellés et les seuils de rapprochement."
-    except requests.RequestException as exc:
-        report["Erreur réseau"] = str(exc)
-    return report
 
 def match_annuaire(rows, commune):
     candidates, warning = annuaire_candidates(commune['nom'], commune.get('codeDepartement', '33'))
@@ -273,8 +231,11 @@ def match_annuaire(rows, commune):
             score = max((SequenceMatcher(None, name, candidate).ratio() for name in names), default=0)
             scored.append((score, href))
         scored.sort(reverse=True)
-        # High-confidence unique name match only. No speculative links.
-        if scored and scored[0][0] >= 0.94 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.12):
+        # Only exact normalized matches, or near-exact unique matches.
+        # Do not guess when the directory uses a different company name.
+        if scored and (scored[0][0] == 1.0 or
+                       (scored[0][0] >= 0.94 and
+                        (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.12))):
             row['Annuaire de l’Ordre'] = scored[0][1]
             row['Type de lien Ordre'] = 'Fiche directe (nom à contrôler)'
             confirmed += 1
@@ -424,18 +385,15 @@ with recherche:
                 st.warning(warning)
             if len(warnings) > 5:
                 st.warning(f"{len(warnings)-5} autres communes sans résultats exploitables.")
-        with st.expander("🛠️ Diagnostic de l’annuaire (en cas de 0 lien direct)"):
-            st.caption("Teste séparément l'accès à l'annuaire et montre les liens présents dans le HTML reçu. Aucun secret API n'est affiché.")
-            if st.button("🔍 Lancer le diagnostic de l’annuaire"):
-                with st.spinner("Diagnostic en cours…"):
-                    st.session_state["diagnostic_annuaire"] = [
-                        diagnostic_annuaire(c, rows) for c in result["communes"][:3]
-                    ]
-            if "diagnostic_annuaire" in st.session_state:
-                for diagnostic in st.session_state["diagnostic_annuaire"]:
-                    st.json(diagnostic, expanded=True)
-                    if diagnostic.get("Liens de fiches détectés", 0) == 0:
-                        st.info("Aucune fiche détectée : le problème est probablement l'accès ou la structure HTML, pas le nom du cabinet.")
+        with st.expander("🛠️ Diagnostic de l’annuaire"):
+            if st.button("Lancer le diagnostic de l’annuaire"):
+                for commune in result["communes"]:
+                    matches, warning = annuaire_candidates(commune["nom"], commune.get("codeDepartement", "33"))
+                    st.write(f"**{commune['nom']}** : {len(matches)} fiches individuelles détectées")
+                    if warning:
+                        st.warning(warning)
+                    st.dataframe(pd.DataFrame(matches, columns=["Nom extrait de l’URL", "Fiche directe"]),
+                                 use_container_width=True)
         st.caption("Les liens proposés automatiquement reposent sur une forte similitude de nom, mais doivent être contrôlés. Les autres ouvrent la liste de la commune.")
         accepted = set(result["bands"])
         known = [r for r in rows if str(r["Code tranche effectif"]) in accepted]
