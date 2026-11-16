@@ -94,7 +94,7 @@ def fetch_establishments(naf, communes, progress):
             if r.status_code != 200:
                 raise RuntimeError(f"INSEE {r.status_code} ({commune['nom']}) : {r.text[:350]}")
             payload = r.json()
-              batch = payload.get("etablissements", [])
+            batch = payload.get("etablissements", [])
             for etab in batch:
                 period = latest_period(etab)
                 # Historical periods can differ from current status/activity.
