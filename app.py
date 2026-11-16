@@ -135,10 +135,31 @@ EFFECTIF_LABELS = {
 SELECTABLE_BANDS = {k: EFFECTIF_LABELS[k] for k in ("02", "03", "11", "12")}
 
 
-def annuaire_url(nom, ville):
-    # Lien de RECHERCHE dans l’annuaire, pas lien direct vers une fiche validée.
-    # L’utilisateur vérifie le bon cabinet dans les résultats affichés.
-    query = urlencode({"type": "societes", "nom": nom, "ville": ville, "dep": ""})
+# Correspondances vérifiées manuellement dans l'annuaire régional.
+# Indexation par SIRET pour éviter les homonymies et les changements de nom.
+FICHES_VERIFIEES = {
+    "42318378900035": "https://annuaire.oecnouvelle-aquitaine.fr/societes/conseil-audit-expertise-comptable/",
+    "43444560700030": "https://annuaire.oecnouvelle-aquitaine.fr/societes/ciron-et-associes/",
+    "46720011900064": "https://annuaire.oecnouvelle-aquitaine.fr/societes/audit-conseil-synthese-expertise/",
+    "53865241300039": "https://annuaire.oecnouvelle-aquitaine.fr/societes/vincent-guillemin/",
+    "53867183500048": "https://annuaire.oecnouvelle-aquitaine.fr/societes/gestion-finance-analyse-et-expertise/",
+    "75301022200036": "https://annuaire.oecnouvelle-aquitaine.fr/societes/sodarex-rive-droite/",
+    "79009473400023": "https://annuaire.oecnouvelle-aquitaine.fr/societes/cabinet-christophe-guerin/",
+    "81793867300032": "https://annuaire.oecnouvelle-aquitaine.fr/societes/3g-guillemin-associes/",
+    "90875988900011": "https://annuaire.oecnouvelle-aquitaine.fr/societes/expertise-law/",
+}
+
+
+def annuaire_url(siret, ville):
+    if str(siret) in FICHES_VERIFIEES:
+        return FICHES_VERIFIEES[str(siret)]
+    # Recherche de secours par commune, sans nom imposé.
+    # L'annuaire utilise la graphie sans accents ni tirets pour la ville.
+    import unicodedata
+    ville = unicodedata.normalize("NFKD", ville or "")
+    ville = "".join(c for c in ville if not unicodedata.combining(c))
+    ville = ville.replace("-", " ").replace("'", " ")
+    query = urlencode({"type": "societes", "nom": "", "ville": " ".join(ville.split()).title(), "dep": ""})
     return "https://annuaire.oecnouvelle-aquitaine.fr/societes/?" + query
 
 
@@ -162,7 +183,7 @@ def row_for(etab):
         "Employeur": period.get("caractereEmployeurEtablissement") or "",
         "Date création": etab.get("dateCreationEtablissement") or "",
         "Siège": "Oui" if etab.get("etablissementSiege") else "Non",
-        "Annuaire de l’Ordre": annuaire_url(legal_name(unite), addr.get("libelleCommuneEtablissement") or ""),
+        "Annuaire de l’Ordre": annuaire_url(etab.get("siret", ""), addr.get("libelleCommuneEtablissement") or ""),
     }
 
 
@@ -219,7 +240,7 @@ with verification:
 
 with recherche:
     st.subheader("🔎 Recherche d'établissements")
-    st.caption("Les liens de l’annuaire ouvrent une recherche par nom et ville ; ils ne garantissent pas une fiche exacte. L’annuaire concerne la Nouvelle-Aquitaine.")
+    st.caption("Les fiches confirmées ouvrent directement le cabinet ; les autres liens ouvrent une recherche par commune. Les correspondances ne sont pas mises à jour automatiquement.")
     naf = st.text_input("Code NAF / APE", value="69.20Z").strip().upper()
     zone = st.radio("Zone géographique", ["Bordeaux Métropole (28 communes)", "Une commune française"], horizontal=True)
     communes = []
