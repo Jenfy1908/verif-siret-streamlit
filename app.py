@@ -1,4 +1,8 @@
 import time
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from urllib.parse import urljoin, urlparse
 from io import BytesIO
 from urllib.parse import urlencode
 
@@ -6,6 +10,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl.styles import PatternFill, Font
+from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="Outils SIRET – API INSEE", page_icon="🏢")
 st.title("🏢 Outils SIRET – API INSEE")
@@ -150,17 +155,91 @@ FICHES_VERIFIEES = {
 }
 
 
-def annuaire_url(siret, ville):
-    if str(siret) in FICHES_VERIFIEES:
-        return FICHES_VERIFIEES[str(siret)]
-    # Recherche de secours par commune, sans nom imposé.
-    # L'annuaire utilise la graphie sans accents ni tirets pour la ville.
-    import unicodedata
-    ville = unicodedata.normalize("NFKD", ville or "")
+ANNUAIRE_BASE = "https://annuaire.oecnouvelle-aquitaine.fr"
+
+
+def normalize_name(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    value = re.sub(r"[^a-zA-Z0-9]+", " ", value).lower()
+    words = [w for w in value.split() if w not in {
+        "societe", "sarl", "sas", "selarl", "selas", "eurl", "sa", "sc", "et", "de", "d", "l", "la", "le", "les"
+    }]
+    return " ".join(words)
+
+
+def annuaire_search_url(ville, departement="33"):
+    ville = unicodedata.normalize("NFKD", str(ville or ""))
     ville = "".join(c for c in ville if not unicodedata.combining(c))
-    ville = ville.replace("-", " ").replace("'", " ")
-    query = urlencode({"type": "societes", "nom": "", "ville": " ".join(ville.split()).title(), "dep": ""})
-    return "https://annuaire.oecnouvelle-aquitaine.fr/societes/?" + query
+    ville = re.sub(r"[-'’]", " ", ville)
+    query = urlencode({"type": "societes", "nom": "", "ville": " ".join(ville.split()).title(), "dep": departement})
+    return f"{ANNUAIRE_BASE}/societes/?{query}"
+
+
+def annuaire_url(siret, ville):
+    return FICHES_VERIFIEES.get(str(siret), annuaire_search_url(ville))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def annuaire_candidates(ville, departement):
+    """Read only public links from a commune's directory results; never open individual profiles."""
+    url = annuaire_search_url(ville, departement)
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; DirectoryLinkFinder/1.0)"}, timeout=12)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return [], f"Annuaire inaccessible pour {ville} : {exc}"
+    soup = BeautifulSoup(response.text, "html.parser")
+    found = {}
+    for link in soup.select('a[href]'):
+        href = urljoin(ANNUAIRE_BASE, link.get('href', ''))
+        parsed = urlparse(href)
+        if parsed.netloc != urlparse(ANNUAIRE_BASE).netloc:
+            continue
+        if not re.fullmatch(r"/societes/[^/]+/", parsed.path):
+            continue
+        title = link.get_text(" ", strip=True)
+        if not title:
+            title = parsed.path.strip('/').split('/')[-1].replace('-', ' ')
+        # A directory listing can contain several links to the same profile.
+        if href not in found or len(title) > len(found[href]):
+            found[href] = title
+    if not found:
+        return [], f"Aucune fiche individuelle détectée dans la page de résultats de {ville}."
+    return [(name, href) for href, name in found.items()], ""
+
+
+def match_annuaire(rows, commune):
+    candidates, warning = annuaire_candidates(commune['nom'], commune.get('codeDepartement', '33'))
+    confirmed = 0
+    for row in rows:
+        if row['Code commune'] != commune['code']:
+            continue
+        siret = str(row['SIRET'])
+        if siret in FICHES_VERIFIEES:
+            row['Annuaire de l’Ordre'] = FICHES_VERIFIEES[siret]
+            row['Type de lien Ordre'] = 'Fiche directe (validée manuellement)'
+            confirmed += 1
+            continue
+        names = [normalize_name(row.get('Raison sociale')), normalize_name(row.get('Enseigne'))]
+        names = [n for n in names if len(n) >= 5]
+        scored = []
+        for label, href in candidates:
+            candidate = normalize_name(label)
+            if not candidate:
+                continue
+            score = max((SequenceMatcher(None, name, candidate).ratio() for name in names), default=0)
+            scored.append((score, href))
+        scored.sort(reverse=True)
+        # High-confidence unique name match only. No speculative links.
+        if scored and scored[0][0] >= 0.94 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.12):
+            row['Annuaire de l’Ordre'] = scored[0][1]
+            row['Type de lien Ordre'] = 'Fiche directe (nom à contrôler)'
+            confirmed += 1
+        else:
+            row['Annuaire de l’Ordre'] = annuaire_search_url(commune['nom'], commune.get('codeDepartement', '33'))
+            row['Type de lien Ordre'] = 'Recherche par commune'
+    return confirmed, warning
 
 
 def row_for(etab):
@@ -184,6 +263,7 @@ def row_for(etab):
         "Date création": etab.get("dateCreationEtablissement") or "",
         "Siège": "Oui" if etab.get("etablissementSiege") else "Non",
         "Annuaire de l’Ordre": annuaire_url(etab.get("siret", ""), addr.get("libelleCommuneEtablissement") or ""),
+        "Type de lien Ordre": "Fiche directe (validée manuellement)" if str(etab.get("siret", "")) in FICHES_VERIFIEES else "Recherche par commune",
     }
 
 
@@ -240,7 +320,7 @@ with verification:
 
 with recherche:
     st.subheader("🔎 Recherche d'établissements")
-    st.caption("Les fiches confirmées ouvrent directement le cabinet ; les autres liens ouvrent une recherche par commune. Les correspondances ne sont pas mises à jour automatiquement.")
+    st.caption("La recherche INSEE reste indépendante. Après les résultats, un bouton permet de rechercher des liens directs vers les fiches publiques de l’Ordre.")
     naf = st.text_input("Code NAF / APE", value="69.20Z").strip().upper()
     zone = st.radio("Zone géographique", ["Bordeaux Métropole (28 communes)", "Une commune française"], horizontal=True)
     communes = []
@@ -287,6 +367,22 @@ with recherche:
     if "recherche_resultats" in st.session_state:
         result = st.session_state["recherche_resultats"]
         rows = result["rows"]
+        if st.button("🔗 Rechercher les fiches directes de l’Ordre", help="Recherche distincte de l’INSEE. Peut dépendre de la disponibilité de l’annuaire."):
+            count = 0
+            warnings = []
+            with st.spinner("Recherche des liens dans l’annuaire régional…"):
+                for commune in result["communes"]:
+                    matches, warning = match_annuaire(rows, commune)
+                    count += matches
+                    if warning:
+                        warnings.append(warning)
+            st.session_state["recherche_resultats"]["rows"] = rows
+            st.success(f"{count} lien(s) direct(s) identifiés, dont les correspondances déjà validées.")
+            for warning in warnings[:5]:
+                st.warning(warning)
+            if len(warnings) > 5:
+                st.warning(f"{len(warnings)-5} autres communes sans résultats exploitables.")
+        st.caption("Les liens proposés automatiquement reposent sur une forte similitude de nom, mais doivent être contrôlés. Les autres ouvrent la liste de la commune.")
         accepted = set(result["bands"])
         known = [r for r in rows if str(r["Code tranche effectif"]) in accepted]
         unknown = [r for r in rows if str(r["Code tranche effectif"]) in ("", "NN")]
@@ -299,7 +395,7 @@ with recherche:
         st.write("**Résultats – tranches sélectionnées**")
         st.dataframe(df_known, use_container_width=True,
                      column_config={"Annuaire de l’Ordre": st.column_config.LinkColumn(
-                         "Annuaire de l’Ordre", display_text="🔗 Rechercher le cabinet")})
+                         "Annuaire de l’Ordre", display_text="🔗 Ouvrir l’annuaire")})
         st.write("**Répartition par tranche sélectionnée**")
         summary = pd.DataFrame([
             {"Tranche d'effectif": SELECTABLE_BANDS[code], "Code INSEE": code,
