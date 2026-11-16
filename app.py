@@ -62,13 +62,14 @@ def excel_bytes(sheets, color_status=False):
                 letter = col[0].column_letter
                 width = min(55, max(13, max(len(str(c.value or "")) for c in col[:150]) + 2))
                 ws.column_dimensions[letter].width = width
-            if "Annuaire de l’Ordre" in frame.columns:
-                link_idx = list(frame.columns).index("Annuaire de l’Ordre") + 1
-                for cells in ws.iter_rows(min_row=2):
-                    cell = cells[link_idx - 1]
-                    if isinstance(cell.value, str) and cell.value.startswith("https://"):
-                        cell.hyperlink = cell.value
-                        cell.font = Font(color="0563C1", underline="single")
+            for link_column in ("Annuaire de l’Ordre", "Fiche possible (à vérifier)"):
+                if link_column in frame.columns:
+                    link_idx = list(frame.columns).index(link_column) + 1
+                    for cells in ws.iter_rows(min_row=2):
+                        cell = cells[link_idx - 1]
+                        if isinstance(cell.value, str) and cell.value.startswith("https://"):
+                            cell.hyperlink = cell.value
+                            cell.font = Font(color="0563C1", underline="single")
             if color_status and "Statut" in frame.columns:
                 idx = list(frame.columns).index("Statut") + 1
                 for cells in list(ws.iter_rows(min_row=2)):
@@ -259,37 +260,65 @@ def annuaire_candidates(ville, departement):
     return [(label, href) for href, label in found.items()], warning
 
 
+def suggestion_score(insee_name, directory_name):
+    """Score indicatif : les correspondances partielles ne sont jamais validées."""
+    similarity = match_score(insee_name, directory_name)
+    a, b = set(insee_name.split()), set(directory_name.split())
+    common = a & b
+    # Un mot distinctif partagé peut signaler une piste (ex. EXTENCIA).
+    distinctive = [word for word in common if len(word) >= 7]
+    if distinctive:
+        similarity = max(similarity, 0.72 if len(distinctive) == 1 else 0.82)
+    return similarity
+
+
 def match_annuaire(rows, commune):
     candidates, warning = annuaire_candidates(commune['nom'], commune.get('codeDepartement', '33'))
     confirmed = 0
+    suggestions = 0
     for row in rows:
         if row['Code commune'] != commune['code']:
             continue
+        row['Fiche possible (à vérifier)'] = ''
+        row['Indice de rapprochement'] = ''
         siret = str(row['SIRET'])
         if siret in FICHES_VERIFIEES:
             row['Annuaire de l’Ordre'] = FICHES_VERIFIEES[siret]
             row['Type de lien Ordre'] = 'Fiche directe (validée manuellement)'
             confirmed += 1
             continue
-        names = [normalize_name(row.get("Raison sociale")), normalize_name(row.get("Enseigne"))]
+        names = [normalize_name(row.get('Raison sociale')), normalize_name(row.get('Enseigne'))]
         names = [name for name in names if len(name) >= 5]
         scored = []
         for label, href in candidates:
             variants = directory_name_variants(label)
-            score = max((match_score(name, variant)
-                         for name in names for variant in variants), default=0.0)
-            scored.append((score, href))
-        scored.sort(reverse=True)
-        # Correspondance unique, exacte ou très proche ; sinon lien de recherche.
+            strict = max((match_score(name, variant)
+                          for name in names for variant in variants), default=0.0)
+            possible = max((suggestion_score(name, variant)
+                            for name in names for variant in variants), default=0.0)
+            scored.append((strict, possible, href))
+        scored.sort(key=lambda item: item[0], reverse=True)
         unique = bool(scored) and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.12)
-        if scored and unique and (scored[0][0] == 1.0 or scored[0][0] >= 0.94):
-            row["Annuaire de l’Ordre"] = scored[0][1]
-            row["Type de lien Ordre"] = "Fiche directe (nom à contrôler)"
+        if scored and unique and scored[0][0] >= 0.94:
+            row['Annuaire de l’Ordre'] = scored[0][2]
+            row['Type de lien Ordre'] = 'Fiche directe (nom à contrôler)'
             confirmed += 1
-        else:
-            row["Annuaire de l’Ordre"] = annuaire_search_url(annuaire_villes(commune["nom"])[0], commune.get("codeDepartement", "33"))
-            row["Type de lien Ordre"] = "Recherche par commune"
-    return confirmed, warning
+            continue
+        row['Annuaire de l’Ordre'] = annuaire_search_url(
+            annuaire_villes(commune['nom'])[0], commune.get('codeDepartement', '33'))
+        row['Type de lien Ordre'] = 'Recherche par commune'
+        # La piste reste séparée de la colonne des fiches directes.
+        # Pas de proposition si les deux meilleurs candidats sont trop proches.
+        possible_rank = sorted(scored, key=lambda item: item[1], reverse=True)
+        if possible_rank and possible_rank[0][1] >= 0.70:
+            top = possible_rank[0]
+            runner = possible_rank[1][1] if len(possible_rank) > 1 else 0.0
+            if top[1] - runner >= 0.08:
+                row['Fiche possible (à vérifier)'] = top[2]
+                row['Indice de rapprochement'] = f"{top[1]:.0%} (indicatif, non vérifié)"
+                row['Type de lien Ordre'] = 'Correspondance possible (à vérifier)'
+                suggestions += 1
+    return confirmed, suggestions, warning
 
 
 def row_for(etab):
@@ -314,6 +343,8 @@ def row_for(etab):
         "Siège": "Oui" if etab.get("etablissementSiege") else "Non",
         "Annuaire de l’Ordre": annuaire_url(etab.get("siret", ""), addr.get("libelleCommuneEtablissement") or ""),
         "Type de lien Ordre": "Fiche directe (validée manuellement)" if str(etab.get("siret", "")) in FICHES_VERIFIEES else "Recherche par commune",
+        "Fiche possible (à vérifier)": "",
+        "Indice de rapprochement": "",
     }
 
 
@@ -419,15 +450,17 @@ with recherche:
         rows = result["rows"]
         if st.button("🔗 Rechercher les fiches directes de l’Ordre", help="Recherche distincte de l’INSEE. Peut dépendre de la disponibilité de l’annuaire."):
             count = 0
+            suggestions = 0
             warnings = []
             with st.spinner("Recherche des liens dans l’annuaire régional…"):
                 for commune in result["communes"]:
-                    matches, warning = match_annuaire(rows, commune)
+                    matches, possible, warning = match_annuaire(rows, commune)
                     count += matches
+                    suggestions += possible
                     if warning:
                         warnings.append(warning)
             st.session_state["recherche_resultats"]["rows"] = rows
-            st.success(f"{count} lien(s) direct(s) identifiés, dont les correspondances déjà validées.")
+            st.success(f"{count} lien(s) direct(s) identifiés ; {suggestions} correspondance(s) possible(s) à vérifier dans une colonne séparée.")
             for warning in warnings[:5]:
                 st.warning(warning)
             if len(warnings) > 5:
@@ -444,7 +477,7 @@ with recherche:
                         st.warning(warning)
                     st.dataframe(pd.DataFrame(matches, columns=["Nom extrait de l’URL", "Fiche directe"]),
                                  use_container_width=True)
-        st.caption("Les liens proposés automatiquement reposent sur une forte similitude de nom, mais doivent être contrôlés. Les autres ouvrent la liste de la commune.")
+        st.caption("Les fiches directes automatiques restent à contrôler. Les pistes incertaines sont isolées dans une colonne distincte ; leur indice n’est pas une probabilité de correspondance.")
         accepted = set(result["bands"])
         known = [r for r in rows if str(r["Code tranche effectif"]) in accepted]
         unknown = [r for r in rows if str(r["Code tranche effectif"]) in ("", "NN")]
@@ -456,8 +489,10 @@ with recherche:
         st.success(f"{len(rows)} établissements actifs employeurs NAF {result['naf']} : {len(known)} dans les tranches choisies, {len(unknown)} à effectif inconnu, {len(excluded)} dans d'autres tranches connues.")
         st.write("**Résultats – tranches sélectionnées**")
         st.dataframe(df_known, use_container_width=True,
-                     column_config={"Annuaire de l’Ordre": st.column_config.LinkColumn(
-                         "Annuaire de l’Ordre", display_text="🔗 Ouvrir l’annuaire")})
+                     column_config={
+                         "Annuaire de l’Ordre": st.column_config.LinkColumn("Annuaire de l’Ordre", display_text="🔗 Ouvrir l’annuaire"),
+                         "Fiche possible (à vérifier)": st.column_config.LinkColumn("Fiche possible (à vérifier)", display_text="🔎 Vérifier la fiche")
+                     })
         st.write("**Répartition par tranche sélectionnée**")
         summary = pd.DataFrame([
             {"Tranche d'effectif": SELECTABLE_BANDS[code], "Code INSEE": code,
