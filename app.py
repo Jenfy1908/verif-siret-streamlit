@@ -159,13 +159,39 @@ ANNUAIRE_BASE = "https://annuaire.oecnouvelle-aquitaine.fr"
 
 
 def normalize_name(value):
+    """Normalise les noms et reconstitue les sigles (S.A.E.C. -> saec)."""
     value = unicodedata.normalize("NFKD", str(value or ""))
     value = "".join(c for c in value if not unicodedata.combining(c))
-    value = re.sub(r"[^a-zA-Z0-9]+", " ", value).lower()
+    value = value.lower()
+    # Recompose uniquement les suites de lettres isolées, sans fusionner
+    # des mots ordinaires : « S.A.E.C. » devient « saec ».
+    value = re.sub(
+        r"(?<![a-z0-9])(?:[a-z]\s*[.\-]\s*){2,}[a-z](?![a-z0-9])",
+        lambda match: re.sub(r"[^a-z]", "", match.group()),
+        value,
+    )
+    value = re.sub(r"[^a-z0-9]+", " ", value)
     words = [w for w in value.split() if w not in {
-        "societe", "sarl", "sas", "selarl", "selas", "eurl", "sa", "sc", "et", "de", "d", "l", "la", "le", "les"
+        "societe", "sarl", "sas", "selarl", "selas", "eurl", "sa", "sc",
+        "et", "de", "d", "l", "la", "le", "les"
     }]
     return " ".join(words)
+
+
+def directory_name_variants(label):
+    """Retire seulement le suffixe numérique WordPress des URL de fiches."""
+    names = {normalize_name(label)}
+    without_suffix = re.sub(r"-?\s+\d+$", "", str(label))
+    if without_suffix != label:
+        names.add(normalize_name(without_suffix))
+    return {name for name in names if name}
+
+
+def match_score(insee_name, directory_name):
+    """Ne rapproche pas des noms commerciaux approximatifs sans preuve."""
+    if insee_name == directory_name:
+        return 1.0
+    return SequenceMatcher(None, insee_name, directory_name).ratio()
 
 
 def annuaire_search_url(ville, departement="33"):
@@ -221,27 +247,24 @@ def match_annuaire(rows, commune):
             row['Type de lien Ordre'] = 'Fiche directe (validée manuellement)'
             confirmed += 1
             continue
-        names = [normalize_name(row.get('Raison sociale')), normalize_name(row.get('Enseigne'))]
-        names = [n for n in names if len(n) >= 5]
+        names = [normalize_name(row.get("Raison sociale")), normalize_name(row.get("Enseigne"))]
+        names = [name for name in names if len(name) >= 5]
         scored = []
         for label, href in candidates:
-            candidate = normalize_name(label)
-            if not candidate:
-                continue
-            score = max((SequenceMatcher(None, name, candidate).ratio() for name in names), default=0)
+            variants = directory_name_variants(label)
+            score = max((match_score(name, variant)
+                         for name in names for variant in variants), default=0.0)
             scored.append((score, href))
         scored.sort(reverse=True)
-        # Only exact normalized matches, or near-exact unique matches.
-        # Do not guess when the directory uses a different company name.
-        if scored and (scored[0][0] == 1.0 or
-                       (scored[0][0] >= 0.94 and
-                        (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.12))):
-            row['Annuaire de l’Ordre'] = scored[0][1]
-            row['Type de lien Ordre'] = 'Fiche directe (nom à contrôler)'
+        # Correspondance unique, exacte ou très proche ; sinon lien de recherche.
+        unique = bool(scored) and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.12)
+        if scored and unique and (scored[0][0] == 1.0 or scored[0][0] >= 0.94):
+            row["Annuaire de l’Ordre"] = scored[0][1]
+            row["Type de lien Ordre"] = "Fiche directe (nom à contrôler)"
             confirmed += 1
         else:
-            row['Annuaire de l’Ordre'] = annuaire_search_url(commune['nom'], commune.get('codeDepartement', '33'))
-            row['Type de lien Ordre'] = 'Recherche par commune'
+            row["Annuaire de l’Ordre"] = annuaire_search_url(commune["nom"], commune.get("codeDepartement", "33"))
+            row["Type de lien Ordre"] = "Recherche par commune"
     return confirmed, warning
 
 
