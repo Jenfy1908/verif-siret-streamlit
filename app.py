@@ -1,15 +1,11 @@
 import time
-import re
-import unicodedata
-from difflib import SequenceMatcher
-from urllib.parse import urlencode, urljoin
-from bs4 import BeautifulSoup
 from io import BytesIO
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
 import streamlit as st
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Font
 
 st.set_page_config(page_title="Outils SIRET – API INSEE", page_icon="🏢")
 st.title("🏢 Outils SIRET – API INSEE")
@@ -61,6 +57,13 @@ def excel_bytes(sheets, color_status=False):
                 letter = col[0].column_letter
                 width = min(55, max(13, max(len(str(c.value or "")) for c in col[:150]) + 2))
                 ws.column_dimensions[letter].width = width
+            if "Annuaire de l’Ordre" in frame.columns:
+                link_idx = list(frame.columns).index("Annuaire de l’Ordre") + 1
+                for cells in ws.iter_rows(min_row=2):
+                    cell = cells[link_idx - 1]
+                    if isinstance(cell.value, str) and cell.value.startswith("https://"):
+                        cell.hyperlink = cell.value
+                        cell.font = Font(color="0563C1", underline="single")
             if color_status and "Statut" in frame.columns:
                 idx = list(frame.columns).index("Statut") + 1
                 for cells in list(ws.iter_rows(min_row=2)):
@@ -132,6 +135,13 @@ EFFECTIF_LABELS = {
 SELECTABLE_BANDS = {k: EFFECTIF_LABELS[k] for k in ("02", "03", "11", "12")}
 
 
+def annuaire_url(nom, ville):
+    # Lien de RECHERCHE dans l’annuaire, pas lien direct vers une fiche validée.
+    # L’utilisateur vérifie le bon cabinet dans les résultats affichés.
+    query = urlencode({"type": "societes", "nom": nom, "ville": ville, "dep": ""})
+    return "https://annuaire.oecnouvelle-aquitaine.fr/societes/?" + query
+
+
 def row_for(etab):
     period = latest_period(etab)
     unite = etab.get("uniteLegale") or {}
@@ -152,150 +162,8 @@ def row_for(etab):
         "Employeur": period.get("caractereEmployeurEtablissement") or "",
         "Date création": etab.get("dateCreationEtablissement") or "",
         "Siège": "Oui" if etab.get("etablissementSiege") else "Non",
+        "Annuaire de l’Ordre": annuaire_url(legal_name(unite), addr.get("libelleCommuneEtablissement") or ""),
     }
-
-
-# Enrichissement expérimental depuis l'annuaire régional de l'Ordre.
-# À activer seulement avec une autorisation adaptée à l'extraction et à la réutilisation.
-ANNUAIRE = "https://annuaire.oecnouvelle-aquitaine.fr/societes/"
-PHONE_RE = re.compile(r"(?<!\d)(?:\+33[\s.\-]?(?:\(0\))?|0)[1-9](?:[\s.\-]?\d{2}){4}(?!\d)")
-
-
-def normalize_name(value):
-    value = unicodedata.normalize("NFKD", str(value or ""))
-    value = "".join(c for c in value if not unicodedata.combining(c))
-    return " ".join(re.sub(r"[^A-Z0-9]+", " ", value.upper()).split())
-
-
-def normalize_phone(value):
-    digits = re.sub(r"\D", "", value)
-    if digits.startswith("33") and len(digits) == 11:
-        digits = "0" + digits[2:]
-    return " ".join(digits[i:i+2] for i in range(0, 10, 2)) if len(digits) == 10 else ""
-
-
-def annuaire_url(commune):
-    return ANNUAIRE + "?" + urlencode({"type": "societes", "nom": "", "ville": commune["nom"], "dep": commune.get("codeDepartement", "")})
-
-
-def read_annuaire_commune(commune):
-    # Ne contourne ni restrictions, ni CAPTCHA, ni contrôle d'accès.
-    url = annuaire_url(commune)
-    response = requests.get(url, headers={"User-Agent": "OutilsSiret/1.0 (consultation annuaire professionnel)"}, timeout=25)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    candidates = []
-    # L'annuaire peut changer de structure : extraction prudente, sans
-    # attribuer un téléphone à un cabinet sans correspondance nominative.
-    for node in soup.find_all(string=PHONE_RE):
-        phone_match = PHONE_RE.search(str(node))
-        if not phone_match:
-            continue
-        phone = normalize_phone(phone_match.group(0))
-        if not phone:
-            continue
-        parent = node.parent
-        for _ in range(5):
-            if parent is None:
-                break
-            text = " ".join(parent.stripped_strings)
-            if 15 <= len(text) <= 700 and len(PHONE_RE.findall(text)) == 1:
-                candidates.append((normalize_name(text), phone))
-                break
-            parent = parent.parent
-    return candidates, url
-
-
-def extract_experts_from_detail(url):
-    """Extraction prudente : uniquement les noms présents dans une rubrique explicite.
-
-    Le balisage du site de l'Ordre n'est pas contractuel. Une absence de résultat
-    signifie « non vérifié », et non « aucun expert-comptable ».
-    """
-    response = requests.get(url, headers={"User-Agent": "OutilsSiret/1.1 (consultation annuaire professionnel)"}, timeout=25)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    names = []
-    # Ne pas deviner des personnes à partir de tous les noms propres de la page.
-    # On exige un intitulé explicite et une liste structurée adjacente.
-    for heading in soup.find_all(["h2", "h3", "h4", "strong"]):
-        heading_text = normalize_name(heading.get_text(" ", strip=True))
-        if not any(term in heading_text for term in ("EXPERTS COMPTABLES", "EXPERT COMPTABLES", "EXPERTS COMPTABLE", "EXPERT COMPTABLE")):
-            continue
-        block = heading.find_next_sibling(["ul", "ol", "div"])
-        if block is None:
-            continue
-        if block.name in ("ul", "ol"):
-            items = block.find_all("li", recursive=False)
-        else:
-            items = block.find_all(["li"], recursive=True)
-        for item in items:
-            name = " ".join(item.stripped_strings).strip(" -•:")
-            if 5 <= len(name) <= 90 and not PHONE_RE.search(name) and "@" not in name:
-                names.append(name)
-    return list(dict.fromkeys(names))
-
-
-def enrich_phones(df, communes, progress):
-    enriched = df.copy()
-    for col in ("Téléphone professionnel", "Source téléphone", "Statut rapprochement",
-                "Lien annuaire", "Experts-comptables", "Source experts", "Statut experts"):
-        enriched[col] = ""
-    by_code = {c["code"]: c for c in communes}
-    caches = {}
-    for i, (idx, row) in enumerate(enriched.iterrows()):
-        code = str(row.get("Code commune", ""))
-        commune = by_code.get(code)
-        if not commune:
-            enriched.at[idx, "Statut rapprochement"] = "Commune non disponible"
-            enriched.at[idx, "Statut experts"] = "Commune non disponible"
-            continue
-        if code not in caches:
-            try:
-                caches[code] = read_annuaire_commune(commune)
-            except requests.RequestException:
-                caches[code] = ([], annuaire_url(commune))
-            time.sleep(1.0)
-        entries, url = caches[code]
-        enriched.at[idx, "Lien annuaire"] = url
-        names = [normalize_name(row.get("Raison sociale", "")), normalize_name(row.get("Enseigne", ""))]
-        names = [n for n in names if len(n) >= 5]
-        matched = set()
-        for text, phone in entries:
-            if any(n in text for n in names):
-                matched.add(phone)
-        if len(matched) == 1:
-            enriched.at[idx, "Téléphone professionnel"] = next(iter(matched))
-            enriched.at[idx, "Source téléphone"] = "Annuaire OEC Nouvelle-Aquitaine"
-            enriched.at[idx, "Statut rapprochement"] = "Nom concordant – à vérifier"
-        elif len(matched) > 1:
-            enriched.at[idx, "Statut rapprochement"] = "Plusieurs numéros possibles – à vérifier"
-        else:
-            enriched.at[idx, "Statut rapprochement"] = "Non trouvé / non vérifié"
-        # Les résultats de commune ne prouvent pas le rattachement des personnes.
-        # La récupération des experts nécessite un lien vers la fiche société
-        # confirmé ; ne pas attribuer des noms issus d'autres cabinets.
-        enriched.at[idx, "Statut experts"] = "Fiche société à vérifier manuellement"
-        progress.progress((i+1)/len(enriched))
-    return enriched
-
-
-def experts_sheet(df):
-    rows = []
-    for _, row in df.iterrows():
-        names = [n.strip() for n in str(row.get("Experts-comptables", "")).split(";") if n.strip()]
-        for name in names:
-            rows.append({"Expert-comptable": name, "Cabinet": row.get("Raison sociale", ""),
-                         "SIRET": row.get("SIRET", ""), "Commune": row.get("Commune", ""),
-                         "Téléphone du cabinet": row.get("Téléphone professionnel", ""),
-                         "Lien annuaire": row.get("Lien annuaire", ""),
-                         "Statut vérification": row.get("Statut experts", "")})
-    return pd.DataFrame(rows, columns=["Expert-comptable", "Cabinet", "SIRET", "Commune",
-                                       "Téléphone du cabinet", "Lien annuaire", "Statut vérification"])
 
 
 verification, recherche = st.tabs(["✅ Vérification SIRET", "🔎 Recherche d'établissements"])
@@ -351,6 +219,7 @@ with verification:
 
 with recherche:
     st.subheader("🔎 Recherche d'établissements")
+    st.caption("Les liens de l’annuaire ouvrent une recherche par nom et ville ; ils ne garantissent pas une fiche exacte. L’annuaire concerne la Nouvelle-Aquitaine.")
     naf = st.text_input("Code NAF / APE", value="69.20Z").strip().upper()
     zone = st.radio("Zone géographique", ["Bordeaux Métropole (28 communes)", "Une commune française"], horizontal=True)
     communes = []
@@ -407,30 +276,9 @@ with recherche:
         df_excluded = pd.DataFrame(excluded, columns=cols)
         st.success(f"{len(rows)} établissements actifs employeurs NAF {result['naf']} : {len(known)} dans les tranches choisies, {len(unknown)} à effectif inconnu, {len(excluded)} dans d'autres tranches connues.")
         st.write("**Résultats – tranches sélectionnées**")
-        st.dataframe(df_known, use_container_width=True)
-        st.divider()
-        st.subheader("☎️ Téléphones et experts-comptables – annuaire de l’Ordre")
-        st.caption("Disponible pour les communes de Nouvelle-Aquitaine. L'annuaire n'est pas une API publique documentée : cette fonction expérimentale peut cesser de fonctionner. Un nom concordant ne garantit pas l'identité du SIRET.")
-        permission = st.checkbox("Je confirme disposer de l'autorisation nécessaire pour interroger automatiquement l'annuaire et réutiliser les coordonnées", key="oec_permission")
-        if st.button("🔎 Enrichir les coordonnées (et préparer les experts-comptables)", disabled=not permission or df_known.empty):
-            with st.spinner("Consultation des pages publiques de l'annuaire…"):
-                try:
-                    bar_phone = st.progress(0)
-                    st.session_state["oec_enriched"] = enrich_phones(df_known, result["communes"], bar_phone)
-                    st.session_state["oec_signature"] = (result["naf"], tuple(sorted(result["bands"])), tuple(sorted(c["code"] for c in result["communes"])))
-                except Exception as exc:
-                    st.error(f"Enrichissement interrompu : {exc}")
-        signature = (result["naf"], tuple(sorted(result["bands"])), tuple(sorted(c["code"] for c in result["communes"])))
-        if st.session_state.get("oec_signature") == signature and "oec_enriched" in st.session_state:
-            df_known = st.session_state["oec_enriched"]
-            st.dataframe(df_known[["Raison sociale", "Commune", "Téléphone professionnel", "Experts-comptables", "Statut rapprochement", "Statut experts", "Lien annuaire"]], use_container_width=True)
-            st.info("Les téléphones proposés doivent être contrôlés. Les noms des experts-comptables nécessitent une fiche société confirmée : aucun rattachement n’est inventé.")
-            st.caption("Tu peux compléter les noms confirmés sur les fiches de l’Ordre dans la colonne Experts-comptables (séparer plusieurs noms par un point-virgule).")
-            edited = st.data_editor(df_known, use_container_width=True, hide_index=True,
-                                    disabled=[c for c in df_known.columns if c not in ("Experts-comptables", "Statut experts")],
-                                    key="edit_experts")
-            df_known = edited.copy()
-            st.session_state["oec_enriched"] = df_known
+        st.dataframe(df_known, use_container_width=True,
+                     column_config={"Annuaire de l’Ordre": st.column_config.LinkColumn(
+                         "Annuaire de l’Ordre", display_text="🔗 Rechercher le cabinet")})
         st.write("**Répartition par tranche sélectionnée**")
         summary = pd.DataFrame([
             {"Tranche d'effectif": SELECTABLE_BANDS[code], "Code INSEE": code,
@@ -442,7 +290,7 @@ with recherche:
             "NAF": result["naf"], "Commune": c["nom"], "Code INSEE commune": c["code"],
             "Tranches retenues": ", ".join(result["bands"]), "Statut": "Actif", "Employeur": "Oui"
         } for c in result["communes"]])
-        sheets = {"Tranches sélectionnées": df_known, "Experts-comptables": experts_sheet(df_known), "Répartition": summary}
+        sheets = {"Tranches sélectionnées": df_known, "Répartition": summary}
         if result["include_unknown"]:
             sheets["Effectifs inconnus"] = df_unknown
         sheets["Autres tranches connues"] = df_excluded
