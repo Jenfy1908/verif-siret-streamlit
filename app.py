@@ -195,44 +195,68 @@ def match_score(insee_name, directory_name):
 
 
 def annuaire_search_url(ville, departement="33"):
-    ville = unicodedata.normalize("NFKD", str(ville or ""))
-    ville = "".join(c for c in ville if not unicodedata.combining(c))
-    ville = re.sub(r"[-'’]", " ", ville)
-    query = urlencode({"type": "societes", "nom": "", "ville": " ".join(ville.split()).title(), "dep": departement})
+    """Construit une recherche sans modifier l'orthographe fournie."""
+    query = urlencode({"type": "societes", "nom": "", "ville": ville, "dep": departement})
     return f"{ANNUAIRE_BASE}/societes/?{query}"
 
 
+def annuaire_villes(ville):
+    """Variantes observées dans l'annuaire pour Villenave-d'Ornon."""
+    base = str(ville or "").strip()
+    normalized = normalize_name(base)
+    if normalized == "villenave ornon":
+        variants = ["Villenave D Ornon", "Villenave D'ornon", "Villenave D Ornon Cedex"]
+    else:
+        # Conserver la forme INSEE et la forme sans ponctuation.
+        plain = unicodedata.normalize("NFKD", base)
+        plain = "".join(c for c in plain if not unicodedata.combining(c))
+        plain = re.sub(r"[-'’]", " ", plain)
+        variants = [base, " ".join(plain.split()).title()]
+    return list(dict.fromkeys(variants))
+
+
 def annuaire_url(siret, ville):
-    return FICHES_VERIFIEES.get(str(siret), annuaire_search_url(ville))
+    return FICHES_VERIFIEES.get(str(siret), annuaire_search_url(annuaire_villes(ville)[0]))
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def annuaire_candidates(ville, departement):
-    """Read only public links from a commune's directory results; never open individual profiles."""
+def annuaire_candidates_variant(ville, departement):
+    """Lit les liens publics d'une seule variante, sans visiter les fiches."""
     url = annuaire_search_url(ville, departement)
     try:
         response = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; DirectoryLinkFinder/1.0)"}, timeout=12)
         response.raise_for_status()
     except requests.RequestException as exc:
-        return [], f"Annuaire inaccessible pour {ville} : {exc}"
+        return [], f"{ville} : {exc}"
     soup = BeautifulSoup(response.text, "html.parser")
     found = {}
-    for link in soup.select('a[href]'):
-        href = urljoin(ANNUAIRE_BASE, link.get('href', ''))
+    for link in soup.select("a[href]"):
+        href = urljoin(ANNUAIRE_BASE, link.get("href", ""))
         parsed = urlparse(href)
         if parsed.netloc != urlparse(ANNUAIRE_BASE).netloc:
             continue
         if not re.fullmatch(r"/societes/[^/]+/", parsed.path):
             continue
-        # The anchor text also contains the postal code, city and telephone.
-        # The URL slug is a cleaner candidate for name matching.
-        title = parsed.path.strip('/').split('/')[-1].replace('-', ' ')
-        # A directory listing can contain several links to the same profile.
-        if href not in found or len(title) > len(found[href]):
-            found[href] = title
-    if not found:
-        return [], f"Aucune fiche individuelle détectée dans la page de résultats de {ville}."
-    return [(name, href) for href, name in found.items()], ""
+        label = parsed.path.strip("/").split("/")[-1].replace("-", " ")
+        found[href] = label
+    return [(label, href) for href, label in found.items()], ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def annuaire_candidates(ville, departement):
+    """Fusionne les résultats de toutes les variantes, sans doublon d'URL."""
+    found = {}
+    errors = []
+    for variant in annuaire_villes(ville):
+        matches, error = annuaire_candidates_variant(variant, departement)
+        if error:
+            errors.append(error)
+        for label, href in matches:
+            found[href] = label
+    warning = " ; ".join(errors)
+    if not found and not warning:
+        warning = f"Aucune fiche individuelle détectée pour {ville}."
+    return [(label, href) for href, label in found.items()], warning
 
 
 def match_annuaire(rows, commune):
@@ -263,7 +287,7 @@ def match_annuaire(rows, commune):
             row["Type de lien Ordre"] = "Fiche directe (nom à contrôler)"
             confirmed += 1
         else:
-            row["Annuaire de l’Ordre"] = annuaire_search_url(commune["nom"], commune.get("codeDepartement", "33"))
+            row["Annuaire de l’Ordre"] = annuaire_search_url(annuaire_villes(commune["nom"])[0], commune.get("codeDepartement", "33"))
             row["Type de lien Ordre"] = "Recherche par commune"
     return confirmed, warning
 
@@ -412,7 +436,10 @@ with recherche:
             if st.button("Lancer le diagnostic de l’annuaire"):
                 for commune in result["communes"]:
                     matches, warning = annuaire_candidates(commune["nom"], commune.get("codeDepartement", "33"))
-                    st.write(f"**{commune['nom']}** : {len(matches)} fiches individuelles détectées")
+                    for variant in annuaire_villes(commune["nom"]):
+                        subset, issue = annuaire_candidates_variant(variant, commune.get("codeDepartement", "33"))
+                        st.caption(f"{variant} : {len(subset)} fiche(s) trouvée(s)" + (f" — {issue}" if issue else ""))
+                    st.write(f"**{commune['nom']}** : {len(matches)} fiches individuelles uniques détectées")
                     if warning:
                         st.warning(warning)
                     st.dataframe(pd.DataFrame(matches, columns=["Nom extrait de l’URL", "Fiche directe"]),
