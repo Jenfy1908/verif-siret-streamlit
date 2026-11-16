@@ -115,6 +115,18 @@ def fetch_establishments(naf, communes, progress):
     return list(found.values())
 
 
+EFFECTIF_LABELS = {
+    "00": "0 salarié", "01": "1 à 2 salariés", "02": "3 à 5 salariés",
+    "03": "6 à 9 salariés", "11": "10 à 19 salariés",
+    "12": "20 à 49 salariés", "21": "50 à 99 salariés",
+    "22": "100 à 199 salariés", "31": "200 à 249 salariés",
+    "32": "250 à 499 salariés", "41": "500 à 999 salariés",
+    "42": "1 000 à 1 999 salariés", "51": "2 000 à 4 999 salariés",
+    "52": "5 000 à 9 999 salariés", "53": "10 000 salariés et plus",
+}
+SELECTABLE_BANDS = {k: EFFECTIF_LABELS[k] for k in ("02", "03", "11", "12")}
+
+
 def row_for(etab):
     period = latest_period(etab)
     unite = etab.get("uniteLegale") or {}
@@ -129,7 +141,9 @@ def row_for(etab):
         "Commune": addr.get("libelleCommuneEtablissement") or "",
         "Code commune": addr.get("codeCommuneEtablissement") or "",
         "Code NAF": period.get("activitePrincipaleEtablissement") or "",
-        "Tranche effectif": tranche, "Année effectif": etab.get("anneeEffectifsEtablissement") or "",
+        "Code tranche effectif": tranche,
+        "Tranche effectif": EFFECTIF_LABELS.get(tranche, "Non renseigné" if not tranche or tranche == "NN" else f"Autre / non précisé ({tranche})"),
+        "Année effectif": etab.get("anneeEffectifsEtablissement") or "",
         "Employeur": period.get("caractereEmployeurEtablissement") or "",
         "Date création": etab.get("dateCreationEtablissement") or "",
         "Siège": "Oui" if etab.get("etablissementSiege") else "Non",
@@ -208,29 +222,60 @@ with recherche:
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         st.error(f"Impossible de récupérer les communes : {exc}")
     st.write("**Statut :** actif uniquement · **Employeur :** oui uniquement")
-    st.write("**Effectifs :** tranche 10–19 salariés et toutes les tranches supérieures")
-    st.info("La tranche 10–19 inclut 10 salariés exactement. Les effectifs inconnus sont exportés séparément.")
-    st.caption("La recherche peut être longue pour une métropole entière. Les effectifs publiés peuvent être anciens.")
-    if st.button("🚀 Rechercher les établissements", disabled=not communes or not naf):
+    selected_bands = st.multiselect(
+        "Tranches d'effectifs à inclure (plusieurs choix possibles)",
+        options=list(SELECTABLE_BANDS),
+        default=list(SELECTABLE_BANDS),
+        format_func=lambda code: f"{SELECTABLE_BANDS[code]} (code {code})",
+        help="Les tranches correspondent aux catégories publiées par l'INSEE, pas à un effectif exact.",
+    )
+    include_unknown = st.checkbox("Exporter les effectifs inconnus dans un onglet séparé", value=True)
+    st.caption("Les effectifs publiés peuvent être anciens ou absents. Les établissements hors tranches sélectionnées ne figurent pas dans les résultats principaux.")
+    st.caption("La recherche peut être longue pour une métropole entière.")
+    if st.button("🚀 Rechercher les établissements", disabled=not communes or not naf or not selected_bands):
         bar = st.progress(0)
         try:
             establishments = fetch_establishments(naf, communes, bar)
             rows = [row_for(e) for e in establishments]
-            st.session_state["recherche_resultats"] = (rows, communes, naf)
+            st.session_state["recherche_resultats"] = {
+                "rows": rows,
+                "communes": communes,
+                "naf": naf,
+                "bands": list(selected_bands),
+                "include_unknown": include_unknown,
+            }
         except Exception as exc:
             st.error(f"Recherche interrompue : {exc}")
     if "recherche_resultats" in st.session_state:
-        rows, searched_communes, searched_naf = st.session_state["recherche_resultats"]
-        # Sirene 10+ workforce bands. 11=10-19; 12=20-49; 21=50-99.
-        accepted = {"11", "12", "21", "22", "31", "32", "41", "42", "51", "52", "53"}
-        known = [r for r in rows if str(r["Tranche effectif"]) in accepted]
-        unknown = [r for r in rows if str(r["Tranche effectif"]) not in accepted]
+        result = st.session_state["recherche_resultats"]
+        rows = result["rows"]
+        accepted = set(result["bands"])
+        known = [r for r in rows if str(r["Code tranche effectif"]) in accepted]
+        unknown = [r for r in rows if str(r["Code tranche effectif"]) in ("", "NN")]
+        excluded = [r for r in rows if str(r["Code tranche effectif"]) not in accepted and str(r["Code tranche effectif"]) not in ("", "NN")]
         cols = list(row_for({}).keys())
         df_known = pd.DataFrame(known, columns=cols)
         df_unknown = pd.DataFrame(unknown, columns=cols)
-        st.success(f"{len(rows)} établissements actifs employeurs NAF {searched_naf} : {len(known)} dans les tranches 10+, {len(unknown)} à effectif inconnu ou inférieur.")
-        st.caption("L'onglet 'À vérifier' contient aussi les tranches connues inférieures à 10, à ne pas confondre avec les effectifs inconnus.")
+        df_excluded = pd.DataFrame(excluded, columns=cols)
+        st.success(f"{len(rows)} établissements actifs employeurs NAF {result['naf']} : {len(known)} dans les tranches choisies, {len(unknown)} à effectif inconnu, {len(excluded)} dans d'autres tranches connues.")
+        st.write("**Résultats – tranches sélectionnées**")
         st.dataframe(df_known, use_container_width=True)
-        params = pd.DataFrame([{"NAF": searched_naf, "Commune": c["nom"], "Code INSEE": c["code"]} for c in searched_communes])
-        st.download_button("📥 Télécharger l'extraction Excel", excel_bytes({"Établissements 10+": df_known, "À vérifier": df_unknown, "Communes et paramètres": params}),
-                           "extraction_insee.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.write("**Répartition par tranche sélectionnée**")
+        summary = pd.DataFrame([
+            {"Tranche d'effectif": SELECTABLE_BANDS[code], "Code INSEE": code,
+             "Établissements": sum(r["Code tranche effectif"] == code for r in known)}
+            for code in result["bands"]
+        ])
+        st.dataframe(summary, hide_index=True, use_container_width=True)
+        params = pd.DataFrame([{
+            "NAF": result["naf"], "Commune": c["nom"], "Code INSEE commune": c["code"],
+            "Tranches retenues": ", ".join(result["bands"]), "Statut": "Actif", "Employeur": "Oui"
+        } for c in result["communes"]])
+        sheets = {"Tranches sélectionnées": df_known, "Répartition": summary}
+        if result["include_unknown"]:
+            sheets["Effectifs inconnus"] = df_unknown
+        sheets["Autres tranches connues"] = df_excluded
+        sheets["Communes et paramètres"] = params
+        st.download_button("📥 Télécharger l'extraction Excel", excel_bytes(sheets),
+                           "extraction_insee_par_effectifs.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
