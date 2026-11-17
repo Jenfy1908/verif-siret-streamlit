@@ -62,7 +62,7 @@ def excel_bytes(sheets, color_status=False):
                 letter = col[0].column_letter
                 width = min(55, max(13, max(len(str(c.value or "")) for c in col[:150]) + 2))
                 ws.column_dimensions[letter].width = width
-            for link_column in ("Annuaire de l’Ordre", "Fiche possible (à vérifier)"):
+            for link_column in ("Annuaire de l’Ordre", "Fiche possible (à vérifier)", "Fiche possible (adresse)"):
                 if link_column in frame.columns:
                     link_idx = list(frame.columns).index(link_column) + 1
                     for cells in ws.iter_rows(min_row=2):
@@ -321,6 +321,109 @@ def match_annuaire(rows, commune):
     return confirmed, suggestions, warning
 
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def annuaire_profile_text(url):
+    """Consulte uniquement une fiche publique, sans collecte de coordonnées personnelles."""
+    parsed = urlparse(url)
+    if parsed.netloc != urlparse(ANNUAIRE_BASE).netloc or not re.fullmatch(r"/societes/[^/]+/", parsed.path):
+        return "", "URL de fiche invalide"
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; DirectoryLinkFinder/1.0)"}, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return "", f"Fiche inaccessible : {exc}"
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup.select("header, footer, nav, script, style, aside"):
+        tag.decompose()
+    body = soup.select_one("main") or soup.select_one("article") or soup.body
+    if body is None:
+        return "", "Contenu de fiche introuvable"
+    return body.get_text(" ", strip=True), ""
+
+
+def street_match(insee_address, page_text):
+    """Preuve indicative : numéro ET nom de voie présents ensemble dans la fiche."""
+    address = normalize_name(insee_address)
+    page = normalize_name(page_text)
+    if not address or not page:
+        return False
+    parts = address.split()
+    numbers = [word for word in parts if word.isdigit()]
+    if not numbers:
+        return False  # Pas de rapprochement sur une voie seule
+    ignore = {"rue", "avenue", "av", "chemin", "allee", "boulevard", "bd", "route", "impasse", "place", "cours", "de", "du", "des", "la", "le", "l"}
+    street_words = [word for word in parts if word not in ignore and not word.isdigit() and len(word) >= 3]
+    if not street_words:
+        return False
+    # Comparaison sur une fenêtre courte pour ne pas mélanger des adresses éloignées.
+    words = page.split()
+    for i, word in enumerate(words):
+        if word != numbers[0]:
+            continue
+        window = words[i:i + 15]
+        if all(token in window for token in street_words):
+            # Le code postal est utile mais parfois absent de la fiche ;
+            # le numéro et la voie restent obligatoires.
+            return True
+    return False
+
+
+def verify_addresses(rows, communes):
+    """Propose des pistes supplémentaires, jamais de validation automatique."""
+    checked = 0
+    suggestions = 0
+    issues = []
+    for commune in communes:
+        candidates, warning = annuaire_candidates(commune['nom'], commune.get('codeDepartement', '33'))
+        if warning:
+            issues.append(warning)
+        for row in rows:
+            if row['Code commune'] != commune['code']:
+                continue
+            row['Fiche possible (adresse)'] = ''
+            row['Contrôle adresse Ordre'] = 'Non vérifiée'
+            if 'Fiche directe' in row.get('Type de lien Ordre', ''):
+                row['Contrôle adresse Ordre'] = 'Lien direct existant — non contrôlé par adresse'
+                continue
+            names = [normalize_name(row.get('Raison sociale')), normalize_name(row.get('Enseigne'))]
+            names = [name for name in names if name]
+            ranked = []
+            for label, href in candidates:
+                variant_names = directory_name_variants(label)
+                score = max((suggestion_score(name, variant) for name in names for variant in variant_names), default=0)
+                if score >= 0.35:
+                    ranked.append((score, href))
+            ranked.sort(reverse=True)
+            priority = row.get('Fiche possible (à vérifier)', '')
+            urls = ([priority] if priority else []) + [href for _, href in ranked[:5]]
+            urls = list(dict.fromkeys(url for url in urls if url))[:6]
+            matching = []
+            accessible = 0
+            for url in urls:
+                if checked >= 100:
+                    break
+                text, error = annuaire_profile_text(url)
+                checked += 1
+                if error:
+                    continue
+                accessible += 1
+                if street_match(row.get('Adresse', ''), text):
+                    matching.append(url)
+            if len(matching) == 1:
+                row['Fiche possible (adresse)'] = matching[0]
+                row['Contrôle adresse Ordre'] = 'Même numéro et voie repérés — identité à confirmer'
+                suggestions += 1
+            elif len(matching) > 1:
+                row['Contrôle adresse Ordre'] = 'Plusieurs fiches à cette adresse — ambigu'
+            elif checked >= 100:
+                row['Contrôle adresse Ordre'] = 'Contrôle incomplet (limite de 100 fiches)'
+            elif not accessible:
+                row['Contrôle adresse Ordre'] = 'Fiches indisponibles ou aucun candidat'
+            else:
+                row['Contrôle adresse Ordre'] = 'Aucune adresse concordante parmi les candidats'
+    return suggestions, checked, issues
+
 def row_for(etab):
     period = latest_period(etab)
     unite = etab.get("uniteLegale") or {}
@@ -345,6 +448,8 @@ def row_for(etab):
         "Type de lien Ordre": "Fiche directe (validée manuellement)" if str(etab.get("siret", "")) in FICHES_VERIFIEES else "Recherche par commune",
         "Fiche possible (à vérifier)": "",
         "Indice de rapprochement": "",
+        "Fiche possible (adresse)": "",
+        "Contrôle adresse Ordre": "Non vérifiée",
     }
 
 
@@ -465,6 +570,13 @@ with recherche:
                 st.warning(warning)
             if len(warnings) > 5:
                 st.warning(f"{len(warnings)-5} autres communes sans résultats exploitables.")
+        if st.button("📍 Comparer les adresses des fiches possibles", help="Consulte un nombre limité de fiches publiques. Les concordances restent à vérifier manuellement."):
+            with st.spinner("Comparaison des adresses publiques (cela peut prendre un peu de temps)…"):
+                address_matches, visited, address_warnings = verify_addresses(rows, result["communes"])
+            st.session_state["recherche_resultats"]["rows"] = rows
+            st.info(f"{address_matches} piste(s) avec adresse concordante parmi {visited} consultation(s) de fiches. Aucune validation automatique.")
+            for warning in address_warnings[:3]:
+                st.warning(warning)
         with st.expander("🛠️ Diagnostic de l’annuaire"):
             if st.button("Lancer le diagnostic de l’annuaire"):
                 for commune in result["communes"]:
@@ -491,7 +603,8 @@ with recherche:
         st.dataframe(df_known, use_container_width=True,
                      column_config={
                          "Annuaire de l’Ordre": st.column_config.LinkColumn("Annuaire de l’Ordre", display_text="🔗 Ouvrir l’annuaire"),
-                         "Fiche possible (à vérifier)": st.column_config.LinkColumn("Fiche possible (à vérifier)", display_text="🔎 Vérifier la fiche")
+                         "Fiche possible (à vérifier)": st.column_config.LinkColumn("Fiche possible (à vérifier)", display_text="🔎 Vérifier la fiche"),
+                         "Fiche possible (adresse)": st.column_config.LinkColumn("Fiche possible (adresse)", display_text="📍 Vérifier l’adresse")
                      })
         st.write("**Répartition par tranche sélectionnée**")
         summary = pd.DataFrame([
